@@ -1,0 +1,6 @@
+langchain
+langchain-ollama
+flask
+requests
+PyYAML
+python-dotenv

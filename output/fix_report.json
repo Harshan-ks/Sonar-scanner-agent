@@ -1,0 +1,18 @@
+{
+  "run_id": "20260918-150526",
+  "project_root": "C:\\Users\\KSHarsha\\AppData\\Local\\Temp\\claude\\C--Users-KSHarsha-OneDrive---Unisys-Documents-Claude-code\\9b85f7ed-b0ad-40f3-a614-c47f9dacd9d3\\scratchpad\\fix_agent_test",
+  "fixed": [
+    {
+      "file": "src/main/java/com/example/Foo.java",
+      "line": 6,
+      "rule": "java:S106",
+      "message": "Replace this use of System.out by a logger.",
+      "severity": "MAJOR",
+      "confidence": 0.9,
+      "auto_fixable": true,
+      "explanation": "Replaced `System.out.println` with an SLF4J `Logger` call in `Foo.java`, resolving the S106 issue.",
+      "fix_status": "fixed"
+    }
+  ],
+  "skipped": []
+}

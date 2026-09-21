@@ -1,0 +1,28 @@
+# Whitelist of SonarQube rules the Sonar Scanner Agent is allowed to consider.
+# This is a hard filter, not just a scoring input: an issue whose rule is NOT
+# on this list is discarded before scoring ever happens. Presence on this
+# list already means "a human has vetted this rule as generally safe enough
+# for an automated fixer to touch" - there is no separate per-rule flag for
+# that anymore (see Approach_confidence_score.txt).
+#
+# Rules are stored as bare numbers (e.g. "S1481"), NOT language-prefixed
+# keys (e.g. "java:S1481"). SonarSource reuses the same rule number across
+# languages for equivalent checks - S1481 ("unused local variable") exists
+# identically in Java, Python, C#, JavaScript, Kotlin, Ruby, PHP, Scala,
+# VB.NET, and more. Matching happens against everything after the last ":"
+# in an issue's rule key, so one entry here applies across every language
+# SonarQube supports, without listing each language separately.
+#
+# Caveat: this assumes a given rule number means the same thing in every
+# language it appears in. That held for every rule below when spot-checked
+# against the live SonarQube instance, but isn't a guarantee SonarSource
+# makes for every rule - verify before adding a new number here.
+#
+# Deliberately NOT included: anything requiring logic or security judgment
+# (e.g. S3776 cognitive complexity, or any VULNERABILITY-type rule).
+
+rules:
+  - S1481   # Unused local variables should be removed
+  - S1854   # Unused assignments / dead stores should be removed
+  - S1128   # Unnecessary imports should be removed
+  - S106    # Standard outputs should not be used directly to log anything
