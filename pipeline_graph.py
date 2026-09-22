@@ -49,7 +49,11 @@ def route_after_scan(state: PipelineState) -> str:
     if not state.get("project_root"):
         print("[pipeline] auto_fix is on but no project_root is set -> skipping fix")
         return END
-    if not any(i.get("confidence", 0) >= fix_agent.CONFIDENCE_THRESHOLD for i in state["issues"]):
+    fixable_candidates = (
+        i for i in state["issues"]
+        if not i.get("needs_human_judgment") and i.get("confidence", 0) >= fix_agent.CONFIDENCE_THRESHOLD
+    )
+    if next(fixable_candidates, None) is None:
         print(f"[pipeline] no issue meets the confidence threshold "
               f"({fix_agent.CONFIDENCE_THRESHOLD}) -> nothing for the Fix Agent to do")
         return END

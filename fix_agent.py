@@ -13,13 +13,19 @@ Before touching a file, a read-only review pass asks Claude whether the
 fix is genuinely safe given the surrounding code, catching context a rigid
 rule-key whitelist can't see (e.g. "this unused variable is referenced in a
 docstring example"). Only if that review says SAFE does the real edit run.
-Issues below the confidence threshold, or rejected by review, are never
-touched, only carried into the report for visibility.
+
+Every issue that doesn't get auto-fixed - because sonar_agent.py already
+flagged it needs_human_judgment, because it's below the confidence
+threshold, or because the review pass rejected it - ends up in
+fix_report.json's "needs_human_judgment" list with a probable_fix
+suggestion, so a human always has a concrete starting point.
 
 Input:   output/issues.json, the local filesystem root of the scanned project
-Process: filter by confidence >= threshold -> group by file -> for each
-         file: back up the original -> read-only review pass -> if SAFE,
-         run `claude -p` (Read+Edit tools, edits auto-accepted) to fix it
+Process: split by needs_human_judgment -> filter remaining by confidence ->
+         group by file -> for each file: back up the original -> read-only
+         review pass -> if SAFE, run `claude -p` (Read+Edit, edits
+         auto-accepted) to fix it; if not, or if below threshold, record it
+         with a probable fix instead
 Output:  modified source files, output/backups/<run_id>/..., output/fix_report.json
 """
 import json
@@ -93,11 +99,11 @@ def build_review_prompt(file_rel_path, issues):
         f"example, via reflection, or as a required test fixture/interface "
         f"override).\n\n"
         f"{issue_lines}\n\n"
-        "Read the file and decide. Respond with EXACTLY one line in this "
-        "format, nothing else:\n"
-        "VERDICT: SAFE - <one sentence reason>\n"
-        "or\n"
-        "VERDICT: UNSAFE - <one sentence reason>"
+        "Read the file and decide. Respond with EXACTLY these two lines, "
+        "nothing else:\n"
+        "VERDICT: SAFE - <one sentence reason>  (use UNSAFE - <reason> if it needs human judgment)\n"
+        "PROBABLE_FIX: <the concrete change that resolves this - what would be applied if safe, "
+        "or what a human should investigate/do if unsafe>"
     )
 
 
@@ -105,20 +111,24 @@ def review_before_fix(project_root, file_rel_path, issues):
     """Read-only sanity check (Read tool only, no Edit) run before fix_file()
     commits to an edit. Fails closed: any error, timeout, or unparseable
     response is treated as UNSAFE so a broken review never silently
-    disables itself into always-approve."""
+    disables itself into always-approve. Always returns a probable_fix
+    suggestion regardless of verdict."""
     prompt = build_review_prompt(file_rel_path, issues)
+    fallback_fix = "; ".join(i["message"] for i in issues)
     try:
         response = claude_cli.run_claude(prompt, cwd=project_root, allowed_tools="Read")
     except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError) as e:
-        return False, f"review call failed: {e}"
+        return False, f"review call failed: {e}", fallback_fix
 
+    text = response.get("result")
     if response.get("is_error"):
-        return False, f"review reported an error: {response.get('result')}"
+        return False, f"review reported an error: {text}", fallback_fix
 
-    safe, reason = claude_cli.parse_verdict(response.get("result"), "SAFE")
+    safe, reason = claude_cli.parse_verdict(text, "SAFE")
+    probable_fix = claude_cli.parse_probable_fix(text, fallback_fix)
     if safe is None:
-        return False, reason
-    return safe, reason
+        return False, reason, probable_fix
+    return safe, reason, probable_fix
 
 
 def apply_fix(project_root, file_rel_path, issues):
@@ -127,14 +137,16 @@ def apply_fix(project_root, file_rel_path, issues):
 
 
 def fix_file(project_root, file_rel_path, issues, run_id):
+    """Returns (fixed_records, human_judgment_records)."""
     file_path = project_root / file_rel_path
     original_code = file_path.read_text(encoding="utf-8")
 
     if REVIEW_BEFORE_FIX:
-        safe, reason = review_before_fix(project_root, file_rel_path, issues)
+        safe, reason, probable_fix = review_before_fix(project_root, file_rel_path, issues)
         if not safe:
             print(f"[fix_agent]   SKIPPED {file_rel_path}: review flagged unsafe - {reason}")
-            return [{**i, "explanation": reason, "fix_status": "skipped_by_review"} for i in issues]
+            human = [{**i, "reason": reason, "probable_fix": probable_fix} for i in issues]
+            return [], human
         print(f"[fix_agent]   review passed for {file_rel_path}: {reason}")
 
     backup_file(project_root, file_rel_path, run_id)
@@ -143,7 +155,7 @@ def fix_file(project_root, file_rel_path, issues, run_id):
         response = apply_fix(project_root, file_rel_path, issues)
     except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError) as e:
         print(f"[fix_agent]   FAILED on {file_rel_path}: {e}")
-        return [{**i, "explanation": None, "fix_status": "failed", "error": str(e)} for i in issues]
+        return [{**i, "explanation": None, "fix_status": "failed", "error": str(e)} for i in issues], []
 
     new_code = file_path.read_text(encoding="utf-8")
     changed = new_code != original_code
@@ -160,7 +172,7 @@ def fix_file(project_root, file_rel_path, issues, run_id):
               f"${response.get('total_cost_usd', 0):.4f})")
 
     explanation = response.get("result")
-    return [{**i, "explanation": explanation, "fix_status": status} for i in issues]
+    return [{**i, "explanation": explanation, "fix_status": status} for i in issues], []
 
 
 def run(project_root, issues_file=None):
@@ -168,26 +180,45 @@ def run(project_root, issues_file=None):
     issues_file = Path(issues_file) if issues_file else DEFAULT_ISSUES_FILE
     issues = load_issues(issues_file)
 
-    fixable = [i for i in issues if i.get("confidence", 0) >= CONFIDENCE_THRESHOLD]
-    skipped = [i for i in issues if i.get("confidence", 0) < CONFIDENCE_THRESHOLD]
+    already_human = [i for i in issues if i.get("needs_human_judgment")]
+    candidates = [i for i in issues if not i.get("needs_human_judgment")]
+
+    fixable = [i for i in candidates if i.get("confidence", 0) >= CONFIDENCE_THRESHOLD]
+    below_threshold = [i for i in candidates if i.get("confidence", 0) < CONFIDENCE_THRESHOLD]
 
     print(f"[fix_agent] {len(fixable)} issue(s) >= confidence threshold {CONFIDENCE_THRESHOLD}, "
-          f"{len(skipped)} skipped (below threshold), review_before_fix={REVIEW_BEFORE_FIX}")
+          f"{len(below_threshold)} below threshold, {len(already_human)} already flagged by "
+          f"sonar_agent, review_before_fix={REVIEW_BEFORE_FIX}")
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    report = {"run_id": run_id, "project_root": str(project_root), "fixed": [], "skipped": skipped}
+    report = {
+        "run_id": run_id,
+        "project_root": str(project_root),
+        "fixed": [],
+        "needs_human_judgment": list(already_human),
+    }
+
+    for issue in below_threshold:
+        probable_fix = claude_cli.suggest_probable_fix(project_root, issue["file"], issue)
+        report["needs_human_judgment"].append({
+            **issue,
+            "reason": f"confidence {issue.get('confidence', 0)} is below threshold {CONFIDENCE_THRESHOLD}",
+            "probable_fix": probable_fix,
+        })
 
     for file_rel_path, file_issues in group_by_file(fixable).items():
         print(f"[fix_agent] Considering {len(file_issues)} issue(s) in {file_rel_path}")
-        applied = fix_file(project_root, file_rel_path, file_issues, run_id)
-        report["fixed"].extend(applied)
+        fixed, human = fix_file(project_root, file_rel_path, file_issues, run_id)
+        report["fixed"].extend(fixed)
+        report["needs_human_judgment"].extend(human)
 
     REPORT_FILE.parent.mkdir(exist_ok=True)
     with open(REPORT_FILE, "w") as f:
         json.dump(report, f, indent=2)
 
     fixed_count = sum(1 for r in report["fixed"] if r["fix_status"] == "fixed")
-    print(f"[fix_agent] Done. {fixed_count}/{len(fixable)} issue(s) fixed. "
+    print(f"[fix_agent] Done. {fixed_count}/{len(fixable)} issue(s) fixed, "
+          f"{len(report['needs_human_judgment'])} left for human judgment. "
           f"Backups in {BACKUP_ROOT / run_id} -> report at {REPORT_FILE}")
     return report
 

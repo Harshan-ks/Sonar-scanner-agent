@@ -3,19 +3,25 @@
 Sonar Scanner Agent
 
 Role: Fetches issues from SonarQube, triages them, and produces a structured,
-confidence-scored list of what's worth fixing.
+confidence-scored list of what's worth fixing. Every issue that matches the
+severity filter gets written to output/issues.json - not just the fixable
+ones. Anything not eligible for an automatic fix is marked
+needs_human_judgment: true and carries a probable_fix suggestion, so a human
+always has a concrete starting point instead of just being told "skipped."
 
 Input:   project key, severity filter, rule whitelist (fix_rules.yaml)
-Process: call SonarQube REST API -> filter by severity -> filter by rule whitelist
-         -> group by file -> score each issue by fix confidence
+Process: call SonarQube REST API -> filter by severity -> for each issue,
+         decide whitelisted / rescued / needs-human-judgment -> group by
+         file -> score each issue by fix confidence
 Output:  output/issues.json -> [{file, line, rule, message, severity, type,
-         confidence, fan_in}, ...]
+         confidence, fan_in, needs_human_judgment, ...}, ...]
 
 Confidence scoring combines two signals (see Approach_confidence_score.txt
 for the full write-up):
   1. Rule whitelist scoring - is this TYPE of issue safe to touch? Presence
-     on fix_rules.yaml is a hard filter (issues off the list never reach
-     scoring at all); type/severity then adjust the score up or down.
+     on fix_rules.yaml is a hard filter for automatic fixing (though not for
+     being recorded at all - see above); type/severity then adjust the
+     score up or down.
   2. Dependency fan-in scoring - is this FILE safe to touch? A file many
      others import is riskier to change than an isolated one, regardless of
      how safe the rule itself is. Fan-in comes from dependency_graph.json
@@ -24,14 +30,16 @@ for the full write-up):
      no entry in it, the fan-in adjustment is neutral (0.0).
 
 Optional LLM rescue (SONAR_LLM_RESCUE=true, off by default): an issue whose
-rule ISN'T on the whitelist is normally dropped outright. When rescue is
-enabled and a project_root is given, non-whitelisted CODE_SMELL issues get
-one read-only Claude Code call asking whether this specific instance is a
-safe, mechanical fix despite the rule never being pre-vetted - catching
-valid candidates a static list would otherwise miss. Rescued issues are
-marked llm_rescued: true and scored with a smaller safety bonus (0.15 vs
-0.30) than a human-vetted whitelist match, reflecting the lower certainty.
-BUG and VULNERABILITY issues are never offered for rescue.
+rule ISN'T on the whitelist would otherwise go straight to human judgment.
+When rescue is enabled and a project_root is given, non-whitelisted
+CODE_SMELL issues get one read-only Claude Code call asking whether this
+specific instance is a safe, mechanical fix despite the rule never being
+pre-vetted - catching valid candidates a static list would otherwise miss.
+That same call always returns a probable_fix too, so a SKIP verdict still
+carries a concrete suggestion. Rescued issues are marked llm_rescued: true
+and scored with a smaller safety bonus (0.15 vs 0.30) than a human-vetted
+whitelist match, reflecting the lower certainty. BUG and VULNERABILITY
+issues are never offered for rescue.
 """
 import json
 import os
@@ -143,30 +151,32 @@ def build_rescue_prompt(file_rel_path, issue):
         "an automated tool to fix with a small, mechanical, low-risk change - "
         "or whether it needs human judgment (e.g. touches business logic, "
         "security, or requires understanding intent beyond the local code).\n\n"
-        "Respond with EXACTLY one line in this format, nothing else:\n"
-        "VERDICT: RESCUE - <one sentence reason>\n"
-        "or\n"
-        "VERDICT: SKIP - <one sentence reason>"
+        "Respond with EXACTLY these two lines, nothing else:\n"
+        "VERDICT: RESCUE - <one sentence reason>  (use SKIP - <reason> if it needs human judgment)\n"
+        "PROBABLE_FIX: <the concrete change that resolves this issue, whether or not it's rescued>"
     )
 
 
 def rescue_review(project_root, file_rel_path, issue):
     """Read-only Claude Code call for an issue whose rule isn't whitelisted.
     Fails closed: any error, timeout, or unparseable response is treated as
-    SKIP so a broken review never silently rescues everything."""
+    SKIP so a broken review never silently rescues everything. Always
+    returns a probable_fix suggestion regardless of verdict."""
     prompt = build_rescue_prompt(file_rel_path, issue)
     try:
         response = claude_cli.run_claude(prompt, cwd=project_root, allowed_tools="Read")
     except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError) as e:
-        return False, f"rescue review call failed: {e}"
+        return False, f"rescue review call failed: {e}", issue["message"]
 
+    text = response.get("result")
     if response.get("is_error"):
-        return False, f"rescue review reported an error: {response.get('result')}"
+        return False, f"rescue review reported an error: {text}", issue["message"]
 
-    rescue, reason = claude_cli.parse_verdict(response.get("result"), "RESCUE")
-    if rescue is None:
-        return False, reason
-    return rescue, reason
+    rescued, reason = claude_cli.parse_verdict(text, "RESCUE")
+    probable_fix = claude_cli.parse_probable_fix(text, issue["message"])
+    if rescued is None:
+        return False, reason, probable_fix
+    return rescued, reason, probable_fix
 
 
 def score_confidence(issue, file_rel_path, dependency_graph, whitelisted=True):
@@ -216,16 +226,6 @@ def run(project_key, severities=None, project_root=None):
         file_path = component[len(prefix):] if component.startswith(prefix) else component
 
         whitelisted = rule_matches_whitelist(issue["rule"], whitelist)
-        rescue_reason = None
-
-        if not whitelisted:
-            if not (rescue_active and issue.get("type") == "CODE_SMELL"):
-                continue
-            rescued, rescue_reason = rescue_review(project_root, file_path, issue)
-            if not rescued:
-                print(f"[sonar_agent]   not rescued: {issue['rule']} in {file_path} - {rescue_reason}")
-                continue
-            print(f"[sonar_agent]   rescued: {issue['rule']} in {file_path} - {rescue_reason}")
 
         entry = {
             "file": file_path,
@@ -234,12 +234,42 @@ def run(project_key, severities=None, project_root=None):
             "message": issue["message"],
             "severity": issue["severity"],
             "type": issue.get("type"),
-            "confidence": score_confidence(issue, file_path, dependency_graph, whitelisted=whitelisted),
-            "fan_in": dependency_graph.get(file_path, {}).get("fan_in"),
         }
-        if not whitelisted:
+
+        if whitelisted:
+            entry["needs_human_judgment"] = False
+            entry["confidence"] = score_confidence(issue, file_path, dependency_graph, whitelisted=True)
+            entry["fan_in"] = dependency_graph.get(file_path, {}).get("fan_in")
+            results.append(entry)
+            continue
+
+        rescue_eligible = rescue_active and issue.get("type") == "CODE_SMELL"
+        rescued = False
+        reason = None
+        probable_fix = None
+
+        if rescue_eligible:
+            rescued, reason, probable_fix = rescue_review(project_root, file_path, issue)
+            if rescued:
+                print(f"[sonar_agent]   rescued: {issue['rule']} in {file_path} - {reason}")
+            else:
+                print(f"[sonar_agent]   not rescued: {issue['rule']} in {file_path} - {reason}")
+        else:
+            reason = ("rule not whitelisted, and not eligible for rescue "
+                      f"(type={issue.get('type')}, rescue_enabled={LLM_RESCUE_ENABLED})")
+            probable_fix = claude_cli.suggest_probable_fix(project_root, file_path, issue)
+
+        entry["confidence"] = score_confidence(issue, file_path, dependency_graph, whitelisted=False)
+        entry["fan_in"] = dependency_graph.get(file_path, {}).get("fan_in")
+
+        if rescued:
+            entry["needs_human_judgment"] = False
             entry["llm_rescued"] = True
-            entry["rescue_reason"] = rescue_reason
+            entry["rescue_reason"] = reason
+        else:
+            entry["needs_human_judgment"] = True
+            entry["reason"] = reason
+            entry["probable_fix"] = probable_fix
 
         results.append(entry)
 
@@ -251,7 +281,9 @@ def run(project_key, severities=None, project_root=None):
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"[sonar_agent] {len(results)} issue(s) survived filtering -> {output_path}")
+    human_count = sum(1 for r in results if r["needs_human_judgment"])
+    print(f"[sonar_agent] {len(results)} issue(s) written -> {output_path} "
+          f"({len(results) - human_count} fixable, {human_count} need human judgment)")
     return results
 
 
