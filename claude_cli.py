@@ -16,6 +16,13 @@ import subprocess
 CLAUDE_BIN = "claude"
 DEFAULT_TIMEOUT_SECONDS = 300
 
+# The SonarQube MCP server (registered at user scope - see `claude mcp list`).
+# show_rule pulls the full rule rationale plus compliant/non-compliant
+# examples straight from the server, rather than relying on Sonar's short
+# one-line issue message alone. Verified reachable under a restricted
+# --allowedTools list before wiring this in.
+MCP_SHOW_RULE = "mcp__sonarqube__show_rule"
+
 
 def run_claude(prompt, cwd, allowed_tools="Read", permission_mode="acceptEdits",
                 timeout=DEFAULT_TIMEOUT_SECONDS):
@@ -48,6 +55,14 @@ def parse_field(response_text, label):
     return match.group(1).strip() if match else None
 
 
+def parse_all_fields(response_text, label):
+    """Like parse_field, but returns every matching line's value instead of
+    just the first - for prompts that ask for one line per item (e.g. one
+    per project, one per metric)."""
+    pattern = re.compile(rf"^{re.escape(label)}:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+    return [m.strip() for m in pattern.findall(response_text or "")]
+
+
 def parse_verdict(response_text, true_word, label="VERDICT"):
     """Parses a "<LABEL>: <WORD> - <reason>" line into
     (matches_true_word: bool | None, reason: str). None means the line
@@ -70,8 +85,10 @@ def build_probable_fix_prompt(file_rel_path, issue):
         f"rather than an automated fix:\n\n"
         f"- Line {issue.get('line')}, rule {issue['rule']} "
         f"({issue['severity']}, type {issue.get('type')}): {issue['message']}\n\n"
-        "Read the file for context, then suggest a concrete, specific fix a "
-        "human could apply. Name the actual change - don't be generic.\n\n"
+        f"Use the show_rule tool (key: {issue['rule']}) to see the full rule "
+        "rationale and compliant/non-compliant examples, then read the file "
+        "for context, then suggest a concrete, specific fix a human could "
+        "apply. Name the actual change - don't be generic.\n\n"
         "Respond with EXACTLY one line in this format, nothing else:\n"
         "PROBABLE_FIX: <your suggestion, one to two sentences>"
     )
@@ -86,7 +103,7 @@ def suggest_probable_fix(project_root, file_rel_path, issue):
         return issue["message"]
     prompt = build_probable_fix_prompt(file_rel_path, issue)
     try:
-        response = run_claude(prompt, cwd=project_root, allowed_tools="Read")
+        response = run_claude(prompt, cwd=project_root, allowed_tools=f"Read {MCP_SHOW_RULE}")
     except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError):
         return issue["message"]
     if response.get("is_error"):

@@ -26,3 +26,7 @@ rules:
   - S1854   # Unused assignments / dead stores should be removed
   - S1128   # Unnecessary imports should be removed
   - S106    # Standard outputs should not be used directly to log anything
+  - S1172   # Unused function/method parameters should be removed
+  - S6709   # Random number generation should be seeded for reproducibility (ML)
+  - S6973   # Important ML estimator/optimizer hyperparameters should be specified
+  - S1161   # "@Override" should be used on overriding and implementing methods (Java-only)

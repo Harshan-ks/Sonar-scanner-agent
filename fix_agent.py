@@ -20,8 +20,19 @@ threshold, or because the review pass rejected it - ends up in
 fix_report.json's "needs_human_judgment" list with a probable_fix
 suggestion, so a human always has a concrete starting point.
 
-Input:   output/issues.json, the local filesystem root of the scanned project
-Process: split by needs_human_judgment -> filter remaining by confidence ->
+Optional targeted mode (command=... on run()): instead of considering every
+issue in issues.json, a free-text request like "fix issue AZxyz123" or
+"resolve all critical and major issues" is first resolved against the
+current issue list via one claude CLI call (resolve_issue_selection), and
+only the matching issues are considered from that point on - same
+confidence threshold and review-before-fix gate as the untargeted run.
+Fails closed: a command that matches nothing fixes nothing, rather than
+falling back to the full list.
+
+Input:   output/issues.json, the local filesystem root of the scanned project,
+         optionally a free-text command narrowing which issues to consider
+Process: [if a command was given: resolve it to a set of issue_keys first] ->
+         split by needs_human_judgment -> filter remaining by confidence ->
          group by file -> for each file: back up the original -> read-only
          review pass -> if SAFE, run `claude -p` (Read+Edit, edits
          auto-accepted) to fix it; if not, or if below threshold, record it
@@ -53,8 +64,12 @@ REVIEW_BEFORE_FIX = os.environ.get("FIX_REVIEW_BEFORE_FIX", "true").lower() == "
 
 
 def load_issues(issues_file):
+    """issues.json is {generated_at, issues: [...]} - see sonar_agent.py's
+    docstring. Only the issue list is needed here; generated_at is for a
+    human skimming the file, not consumed by this code."""
     with open(issues_file) as f:
-        return json.load(f)
+        data = json.load(f)
+    return data["issues"]
 
 
 def group_by_file(issues):
@@ -72,6 +87,48 @@ def backup_file(project_root, file_rel_path, run_id):
     return dst
 
 
+def build_selection_prompt(command, issues):
+    issue_lines = "\n".join(
+        f"- {i.get('issue_key', '?')}: {i['rule']} ({i['severity']}) in {i['file']} "
+        f"line {i.get('line')}: {i['message']}"
+        for i in issues
+    )
+    return (
+        f'A user asked, in their own words, to fix some issues: "{command}"\n\n'
+        f"Here is the full list of currently known SonarQube issues:\n\n{issue_lines}\n\n"
+        "Decide exactly which of the issues above the request refers to - whether "
+        "it names one or more specific issue keys, or describes a category (a "
+        "severity, a rule, a file, or similar). Respond with EXACTLY one line per "
+        "matching issue, nothing else:\n"
+        "ISSUE_KEY: <key>\n\n"
+        "If none of the issues above match the request, respond with exactly:\n"
+        "NONE"
+    )
+
+
+def resolve_issue_selection(command, issues):
+    """Parses a free-text fix request (e.g. "fix issue AZxyz123" or "resolve
+    all critical and major issues") against the currently known issue list,
+    via one claude CLI call - no file access needed, just reasoning over the
+    list embedded in the prompt. Fails closed: any error, timeout,
+    unparseable response, or an explicit NONE all resolve to an empty list,
+    so a broken parse can never silently select every issue instead of the
+    intended few."""
+    prompt = build_selection_prompt(command, issues)
+    try:
+        response = claude_cli.run_claude(prompt, cwd=BASE_DIR, allowed_tools="")
+    except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError) as e:
+        print(f"[fix_agent] command parsing failed: {e}")
+        return []
+
+    text = response.get("result") or ""
+    if response.get("is_error"):
+        print(f"[fix_agent] command parsing reported an error: {text}")
+        return []
+
+    return [k for k in claude_cli.parse_all_fields(text, "ISSUE_KEY") if k]
+
+
 def build_fix_prompt(file_rel_path, issues):
     issue_lines = "\n".join(
         f"- Line {i['line']}, rule {i['rule']} ({i['severity']}): {i['message']}"
@@ -80,9 +137,12 @@ def build_fix_prompt(file_rel_path, issues):
     return (
         f'Fix the following SonarQube issue(s) in "{file_rel_path}":\n\n'
         f"{issue_lines}\n\n"
-        "Read the file, make the smallest possible change(s) that resolve exactly "
-        "these issues, and save the file. Do not refactor unrelated code or change "
-        "behavior beyond what each rule requires."
+        "If you're unsure exactly what a rule requires, use the show_rule tool "
+        "(key: the rule id above) to see its full rationale and "
+        "compliant/non-compliant examples. Read the file, make the smallest "
+        "possible change(s) that resolve exactly these issues, and save the "
+        "file. Do not refactor unrelated code or change behavior beyond what "
+        "each rule requires."
     )
 
 
@@ -99,8 +159,9 @@ def build_review_prompt(file_rel_path, issues):
         f"example, via reflection, or as a required test fixture/interface "
         f"override).\n\n"
         f"{issue_lines}\n\n"
-        "Read the file and decide. Respond with EXACTLY these two lines, "
-        "nothing else:\n"
+        "Use the show_rule tool (key: the rule id above) to see the full rule "
+        "rationale and compliant/non-compliant examples, then read the file "
+        "and decide. Respond with EXACTLY these two lines, nothing else:\n"
         "VERDICT: SAFE - <one sentence reason>  (use UNSAFE - <reason> if it needs human judgment)\n"
         "PROBABLE_FIX: <the concrete change that resolves this - what would be applied if safe, "
         "or what a human should investigate/do if unsafe>"
@@ -116,7 +177,9 @@ def review_before_fix(project_root, file_rel_path, issues):
     prompt = build_review_prompt(file_rel_path, issues)
     fallback_fix = "; ".join(i["message"] for i in issues)
     try:
-        response = claude_cli.run_claude(prompt, cwd=project_root, allowed_tools="Read")
+        response = claude_cli.run_claude(
+            prompt, cwd=project_root, allowed_tools=f"Read {claude_cli.MCP_SHOW_RULE}",
+        )
     except (subprocess.TimeoutExpired, RuntimeError, json.JSONDecodeError) as e:
         return False, f"review call failed: {e}", fallback_fix
 
@@ -133,7 +196,9 @@ def review_before_fix(project_root, file_rel_path, issues):
 
 def apply_fix(project_root, file_rel_path, issues):
     prompt = build_fix_prompt(file_rel_path, issues)
-    return claude_cli.run_claude(prompt, cwd=project_root, allowed_tools="Read Edit")
+    return claude_cli.run_claude(
+        prompt, cwd=project_root, allowed_tools=f"Read Edit {claude_cli.MCP_SHOW_RULE}",
+    )
 
 
 def fix_file(project_root, file_rel_path, issues, run_id):
@@ -175,10 +240,23 @@ def fix_file(project_root, file_rel_path, issues, run_id):
     return [{**i, "explanation": explanation, "fix_status": status} for i in issues], []
 
 
-def run(project_root, issues_file=None):
+def run(project_root, issues_file=None, command=None):
     project_root = Path(project_root)
     issues_file = Path(issues_file) if issues_file else DEFAULT_ISSUES_FILE
     issues = load_issues(issues_file)
+
+    if command:
+        selected_keys = resolve_issue_selection(command, issues)
+        if not selected_keys:
+            print(f"[fix_agent] command {command!r} matched no known issue - nothing to do")
+            return {
+                "run_id": None, "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "command": command, "project_root": str(project_root),
+                "fixed": [], "needs_human_judgment": [],
+            }
+        issues = [i for i in issues if i.get("issue_key") in selected_keys]
+        print(f"[fix_agent] command {command!r} matched {len(issues)} issue(s): "
+              f"{', '.join(selected_keys)}")
 
     already_human = [i for i in issues if i.get("needs_human_judgment")]
     candidates = [i for i in issues if not i.get("needs_human_judgment")]
@@ -193,6 +271,8 @@ def run(project_root, issues_file=None):
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     report = {
         "run_id": run_id,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "command": command,
         "project_root": str(project_root),
         "fixed": [],
         "needs_human_judgment": list(already_human),

@@ -1,0 +1,12 @@
+# Maps each SonarQube project key to its local filesystem checkout.
+# SonarQube itself has no concept of "where is this checked out on my
+# machine" - this is what `main.py scan-all` uses to know which discovered
+# projects it can actually run the Fix Agent against, and where.
+#
+# A project discovered via `main.py projects` that has no entry here is
+# skipped (with a warning) by `scan-all`, not treated as an error.
+
+projects:
+  "com.example:Studentmanagement": "C:\\Users\\KSHarsha\\OneDrive - Unisys\\Desktop\\Intern Training\\Studentmanagement"
+  "LoanPrediction": "C:\\Pros_IT\\awesome-python-projects\\LOAN PREDICTION"
+  "AirlineReservationSystem": "C:\\Pros_IT\\Java_projects\\Java-Projects-Collections\\Projects\\Airline-Reservation-System"
